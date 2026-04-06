@@ -65,4 +65,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 ENTRYPOINT ["dumb-init", "--"]
 
 # Start the server
-CMD ["node", "--loader", "tsx", "server.ts"]
+CMD ["node", "--import", "tsx", "server.ts"]
