@@ -1,0 +1,5 @@
+{
+  "name": "agillo — Collaborative Planning Poker",
+  "description": "A distributed planning poker tool for software teams. Estimate Jira issues in real-time with Fibonacci or T-shirt sizing.",
+  "requestFramePermissions": []
+}
