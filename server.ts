@@ -7,10 +7,133 @@ import axios from "axios";
 import cookieSession from "cookie-session";
 import cookie from "cookie";
 import { v4 as uuidv4 } from "uuid";
-import { Session, ClientMessage, ServerMessage, Participant, Issue } from "./src/types";
+import Redis from "ioredis";
+import { Session, ClientMessage, ServerMessage, Participant, Issue } from "./src/types.js";
+import { createLLMProvider } from "./src/lib/llm/index.js";
 
-const sessions: Record<string, Session> = {};
 const clients: Record<string, Set<WebSocket>> = {};
+
+// Initialize Redis client
+const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+let redis: Redis | null = null;
+let useInMemorySessions = true;
+
+// Initialize LLM Provider
+let llmProvider: ReturnType<typeof createLLMProvider>;
+try {
+  llmProvider = createLLMProvider();
+} catch (err) {
+  console.error("Failed to initialize LLM provider:", err);
+  console.error("AI features will be disabled. Please set LLM_PROVIDER and appropriate API key in .env");
+}
+
+// Initialize Redis
+try {
+  redis = new Redis(redisUrl, {
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 50, 2000);
+      return delay;
+    },
+    reconnectOnError: (err) => {
+      const targetError = 'READONLY';
+      if (err.message.includes(targetError)) {
+        // Only reconnect when the error contains "READONLY"
+        return true;
+      }
+      return false;
+    }
+  });
+
+  redis.on('connect', () => {
+    console.log('Connected to Redis');
+    useInMemorySessions = false;
+  });
+
+  redis.on('error', (err) => {
+    console.error('Redis connection error, falling back to in-memory sessions:', err.message);
+    useInMemorySessions = true;
+  });
+
+  // Test Redis connection
+  redis.ping().then(() => {
+    console.log('Redis ping successful');
+  }).catch((err) => {
+    console.error('Redis ping failed, using in-memory sessions:', err.message);
+    useInMemorySessions = true;
+    redis = null;
+  });
+
+} catch (err) {
+  console.error('Failed to initialize Redis, using in-memory sessions:', err);
+  redis = null;
+}
+
+// Fallback in-memory sessions
+const inMemorySessions: Record<string, Session> = {};
+
+// Session helper functions
+async function getSession(sessionId: string): Promise<Session | null> {
+  if (redis && !useInMemorySessions) {
+    try {
+      const data = await redis.get(`session:${sessionId}`);
+      return data ? JSON.parse(data) : null;
+    } catch (err) {
+      console.error('Redis get error:', err);
+      return inMemorySessions[sessionId] || null;
+    }
+  }
+  return inMemorySessions[sessionId] || null;
+}
+
+async function setSession(sessionId: string, session: Session): Promise<void> {
+  if (redis && !useInMemorySessions) {
+    try {
+      await redis.set(`session:${sessionId}`, JSON.stringify(session));
+      // Set expiration to 24 hours
+      await redis.expire(`session:${sessionId}`, 24 * 60 * 60);
+    } catch (err) {
+      console.error('Redis set error:', err);
+      inMemorySessions[sessionId] = session;
+    }
+  } else {
+    inMemorySessions[sessionId] = session;
+  }
+}
+
+async function deleteSession(sessionId: string): Promise<void> {
+  if (redis && !useInMemorySessions) {
+    try {
+      await redis.del(`session:${sessionId}`);
+    } catch (err) {
+      console.error('Redis delete error:', err);
+      delete inMemorySessions[sessionId];
+    }
+  } else {
+    delete inMemorySessions[sessionId];
+  }
+}
+
+async function getAllSessions(): Promise<Record<string, Session>> {
+  if (redis && !useInMemorySessions) {
+    try {
+      const keys = await redis.keys('session:*');
+      const sessions: Record<string, Session> = {};
+      for (const key of keys) {
+        const sessionId = key.replace('session:', '');
+        const data = await redis.get(key);
+        if (data) {
+          sessions[sessionId] = JSON.parse(data);
+        }
+      }
+      return sessions;
+    } catch (err) {
+      console.error('Redis getAll error:', err);
+      return inMemorySessions;
+    }
+  }
+  return inMemorySessions;
+}
 
 // Helper to parse Jira ADF (Atlassian Document Format) or plain text
 function parseJiraDescription(description: any): string {
@@ -241,7 +364,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/sessions", (req, res) => {
+  app.post("/api/sessions", async (req, res) => {
     const { id, name, mode } = req.body;
     if (!id || !name) {
       return res.status(400).json({ error: "Missing session ID or name" });
@@ -254,12 +377,12 @@ async function startServer() {
       participants: {},
       issues: [],
     };
-    sessions[id] = session;
+    await setSession(id, session);
     res.status(201).json(session);
   });
 
-  app.get("/api/sessions/:id", (req, res) => {
-    const session = sessions[req.params.id];
+  app.get("/api/sessions/:id", async (req, res) => {
+    const session = await getSession(req.params.id);
     if (!session) {
       return res.status(404).json({ error: "Session not found" });
     }
@@ -292,7 +415,7 @@ async function startServer() {
       try {
         const message: ClientMessage = JSON.parse(data.toString());
         const { type, sessionId } = message;
-        const session = sessions[sessionId];
+        const session = await getSession(sessionId);
 
         if (!session && type !== 'JOIN_SESSION') {
           ws.send(JSON.stringify({ type: 'ERROR', message: 'Session not found' }));
@@ -305,8 +428,9 @@ async function startServer() {
             currentSessionId = sessionId;
             currentParticipantId = participant.id;
 
-            if (!sessions[sessionId]) {
-              sessions[sessionId] = {
+            let session = await getSession(sessionId);
+            if (!session) {
+              session = {
                 id: sessionId,
                 name: "New Session",
                 mode: 'FIBONACCI',
@@ -315,13 +439,14 @@ async function startServer() {
                 issues: [],
               };
             }
-            
-            sessions[sessionId].participants[participant.id] = participant;
-            
+
+            session.participants[participant.id] = participant;
+            await setSession(sessionId, session);
+
             if (!clients[sessionId]) clients[sessionId] = new Set();
             clients[sessionId].add(ws);
 
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session: sessions[sessionId] });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -329,7 +454,7 @@ async function startServer() {
             const { participantId, vote } = message;
             if (session.participants[participantId]) {
               session.participants[participantId].vote = vote;
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
@@ -338,21 +463,21 @@ async function startServer() {
             const { participantId, isAnonymous } = message;
             if (session.participants[participantId]) {
               session.participants[participantId].isAnonymous = isAnonymous;
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
 
           case 'REVEAL_VOTES': {
             session.isRevealed = true;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'RESET_VOTES': {
             session.isRevealed = false;
             Object.values(session.participants).forEach(p => p.vote = undefined);
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -360,14 +485,14 @@ async function startServer() {
             session.currentIssueId = message.issueId;
             session.isRevealed = false;
             Object.values(session.participants).forEach(p => p.vote = undefined);
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'ADD_ISSUE': {
             session.issues.push(message.issue);
             if (!session.currentIssueId) session.currentIssueId = message.issue.id;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -378,7 +503,7 @@ async function startServer() {
               issue.estimate = message.estimate;
               session.isRevealed = false;
               Object.values(session.participants).forEach(p => p.vote = undefined);
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
@@ -391,35 +516,35 @@ async function startServer() {
               session.stickers = {};
               session.categories = [];
             }
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'START_TIMER': {
             session.timerStart = Date.now();
             session.timerDuration = message.duration;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'STOP_TIMER': {
             session.timerStart = undefined;
             session.timerDuration = undefined;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'ADD_STICKER': {
             if (!session.stickers) session.stickers = {};
             session.stickers[message.sticker.id] = message.sticker;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'UPDATE_STICKER': {
             if (session.stickers && session.stickers[message.stickerId]) {
               session.stickers[message.stickerId].text = message.text;
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
@@ -427,13 +552,82 @@ async function startServer() {
           case 'REMOVE_STICKER': {
             if (session.stickers && session.stickers[message.stickerId]) {
               delete session.stickers[message.stickerId];
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
 
           case 'CATEGORIZE_STICKERS': {
-            // No-op on server, handled by client
+            if (!llmProvider) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'LLM provider not configured' }));
+              break;
+            }
+            if (!session.stickers || Object.keys(session.stickers).length === 0) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'No stickers to categorize' }));
+              break;
+            }
+
+            try {
+              const stickersList = Object.values(session.stickers).map(s => ({ id: s.id, text: s.text }));
+
+              const response = await llmProvider.generateStructured<{
+                title: string;
+                stickerIds: string[];
+              }[]>(`Group the following feedback items into logical themes.
+              Return a JSON array of groups, where each group has a "title" and an array of "stickerIds".
+              Stickers: ${JSON.stringify(stickersList)}`, {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string' },
+                    stickerIds: { type: 'array', items: { type: 'string' } }
+                  },
+                  required: ['title', 'stickerIds']
+                }
+              });
+
+              const newGroups: Record<string, any> = {};
+              const stickerUpdates: Record<string, string> = {};
+
+              response.forEach((g) => {
+                const groupId = `group-${uuidv4()}`;
+                newGroups[groupId] = {
+                  id: groupId,
+                  title: g.title,
+                  votes: {}
+                };
+                g.stickerIds.forEach((sid) => {
+                  stickerUpdates[sid] = groupId;
+                });
+              });
+
+              // Handle any stickers that weren't grouped
+              const ungroupedStickers = Object.keys(session.stickers).filter(sid => !stickerUpdates[sid]);
+              if (ungroupedStickers.length > 0) {
+                const ungroupedId = `group-ungrouped`;
+                newGroups[ungroupedId] = {
+                  id: ungroupedId,
+                  title: "Other / Ungrouped",
+                  votes: {}
+                };
+                ungroupedStickers.forEach(sid => {
+                  stickerUpdates[sid] = ungroupedId;
+                });
+              }
+
+              session.stickerGroups = newGroups;
+              Object.entries(stickerUpdates).forEach(([stickerId, groupId]) => {
+                if (session.stickers && session.stickers[stickerId]) {
+                  session.stickers[stickerId].groupId = groupId;
+                }
+              });
+              session.refinementPhase = 'GROUPING';
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
+            } catch (err) {
+              console.error("CATEGORIZE_STICKERS error:", err);
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to categorize stickers' }));
+            }
             break;
           }
 
@@ -445,18 +639,211 @@ async function startServer() {
                 session.stickers![update.id].categories = update.categories;
               }
             });
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'ANALYZE_SESSION': {
-            // No-op on server, handled by client
+            if (!llmProvider) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'LLM provider not configured' }));
+              break;
+            }
+            if (!session.stickerGroups || Object.keys(session.stickerGroups).length === 0) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'No groups to analyze' }));
+              break;
+            }
+
+            try {
+              const groupsList = Object.values(session.stickerGroups).map(g => {
+                const totalVotes = Object.values(g.votes || {}).reduce((a, b) => a + b, 0);
+                const priorityRank = session.groupRanking?.indexOf(g.id) ?? -1;
+                const groupStickers = Object.values(session.stickers || {}).filter(s => s.groupId === g.id).map(s => s.text);
+                return {
+                  id: g.id,
+                  title: g.title,
+                  stickers: groupStickers,
+                  votes: totalVotes,
+                  priorityRank: priorityRank >= 0 ? priorityRank + 1 : 999
+                };
+              });
+
+              const response = await llmProvider.generateStructured<{
+                summary: string;
+                good: string[];
+                bad: string[];
+                blockers: string[];
+                ideas: string[];
+                actionItems: Array<{
+                  title: string;
+                  description: string;
+                  linkedGroupIds: string[];
+                }>;
+              }>(`Analyze the following prioritized groups of feedback from a retrospective or refinement session.
+              Identify the good things, the bad things, the blockers, and the ideas.
+              Create a brief summary of the session.
+              Propose actionable items based on the feedback groups, focusing on the highest priority ones.
+              IMPORTANT: For each action item, provide an array of "linkedGroupIds" corresponding to the IDs of the groups that inspired it.
+              Return a JSON object.
+              Groups: ${JSON.stringify(groupsList)}`, {
+                type: 'object',
+                properties: {
+                  summary: { type: 'string' },
+                  good: { type: 'array', items: { type: 'string' } },
+                  bad: { type: 'array', items: { type: 'string' } },
+                  blockers: { type: 'array', items: { type: 'string' } },
+                  ideas: { type: 'array', items: { type: 'string' } },
+                  actionItems: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        title: { type: 'string' },
+                        description: { type: 'string' },
+                        linkedGroupIds: { type: 'array', items: { type: 'string' } }
+                      },
+                      required: ['title', 'description', 'linkedGroupIds']
+                    }
+                  }
+                },
+                required: ['summary', 'good', 'bad', 'blockers', 'ideas', 'actionItems']
+              });
+
+              const actionItemsWithIds = (response.actionItems || []).map((item) => ({
+                id: uuidv4(),
+                title: item.title,
+                description: item.description,
+                linkedGroupIds: item.linkedGroupIds || []
+              }));
+
+              session.analysis = {
+                summary: response.summary || "",
+                good: response.good || [],
+                bad: response.bad || [],
+                blockers: response.blockers || [],
+                ideas: response.ideas || [],
+                actionItems: actionItemsWithIds
+              };
+
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
+            } catch (err) {
+              console.error("ANALYZE_SESSION error:", err);
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to analyze session' }));
+            }
+            break;
+          }
+
+          case 'QUICK_WIN_ANALYSIS': {
+            if (!llmProvider) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'LLM provider not configured' }));
+              break;
+            }
+            if (!session.analysis || !session.groupRanking || !session.complexityRanking) {
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'Missing required data for quick win analysis' }));
+              break;
+            }
+
+            try {
+              // Calculate quick wins (server-side version of calculateQuickWins)
+              const totalGroups = session.groupRanking.length;
+
+              const quickWins = session.analysis.actionItems.map(action => {
+                const complexityScore = session.complexityRanking!.indexOf(action.id);
+
+                let valueScore = 0;
+                let groupVotes = 0;
+                let groupTitles: string[] = [];
+
+                if (action.linkedGroupIds && action.linkedGroupIds.length > 0) {
+                  valueScore = action.linkedGroupIds.reduce((sum, gid) => {
+                    const g = session.stickerGroups![gid];
+                    if (!g) return sum;
+                    const votes = Object.values(g.votes || {}).reduce((a, b) => a + b, 0);
+                    groupVotes += votes;
+                    groupTitles.push(g.title);
+                    const priorityRank = session.groupRanking!.indexOf(gid);
+                    const priorityScore = priorityRank >= 0 ? (totalGroups - priorityRank) : 0;
+                    return sum + (votes * 2) + priorityScore;
+                  }, 0) / action.linkedGroupIds.length;
+                }
+
+                const quickWinIndex = valueScore / (complexityScore + 1);
+
+                return {
+                  id: action.id,
+                  title: action.title,
+                  description: action.description,
+                  valueScore,
+                  complexityScore,
+                  quickWinIndex,
+                  groupVotes,
+                  groupTitles
+                };
+              }).sort((a, b) => {
+                if (b.groupVotes !== a.groupVotes) {
+                  return b.groupVotes - a.groupVotes; // Sort by group votes first
+                }
+                return b.quickWinIndex - a.quickWinIndex; // Then by quick win index
+              });
+
+              if (quickWins.length === 0) {
+                ws.send(JSON.stringify({ type: 'ERROR', message: 'No action items to analyze' }));
+                break;
+              }
+
+              const response = await llmProvider.generateStructured<{
+                summary: string;
+                rankedItems: Array<{
+                  actionItemId: string;
+                  justification: string;
+                }>;
+              }>(`Based on the following prioritized action items (sorted primarily by the votes of their parent groups, then by Quick Win Index: high value, low complexity), generate a final execution plan and summary for the team.
+              The action items are derived from grouped feedback. Pay special attention to the "groupVotes" and "groupTitles" fields, as action items from highly voted groups are listed first and should be addressed first.
+
+              Action Items:
+              ${JSON.stringify(quickWins.map(qw => ({
+                id: qw.id,
+                title: qw.title,
+                description: qw.description,
+                valueScore: qw.valueScore,
+                complexityScore: qw.complexityScore,
+                quickWinIndex: qw.quickWinIndex,
+                groupVotes: qw.groupVotes,
+                groupTitles: qw.groupTitles
+              })))}
+
+              Return a JSON object with:
+              - summary: A brief encouraging summary of the plan, explicitly mentioning the top themes/groups that the team prioritized based on votes.
+              - rankedItems: An array of objects containing the actionItemId and a brief justification for its priority (mentioning its group's votes or value vs complexity).`, {
+                type: 'object',
+                properties: {
+                  summary: { type: 'string' },
+                  rankedItems: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        actionItemId: { type: 'string' },
+                        justification: { type: 'string' }
+                      },
+                      required: ['actionItemId', 'justification']
+                    }
+                  }
+                },
+                required: ['summary', 'rankedItems']
+              });
+
+              session.finalAnalysis = response;
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
+            } catch (err) {
+              console.error("QUICK_WIN_ANALYSIS error:", err);
+              ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to perform quick win analysis' }));
+            }
             break;
           }
 
           case 'SAVE_ANALYSIS': {
             session.analysis = message.analysis;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -494,7 +881,7 @@ async function startServer() {
               });
 
               actionItem.jiraIssueKey = response.data.key;
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             } catch (err) {
               console.error("Jira Task Creation Error:", err);
               ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to create Jira task' }));
@@ -556,7 +943,7 @@ async function startServer() {
 
               const confluenceUrl = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki${response.data._links.webui}`;
               session.analysis.confluenceUrl = confluenceUrl;
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             } catch (err) {
               console.error("Confluence Export Error:", err);
               ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to export to Confluence' }));
@@ -566,7 +953,7 @@ async function startServer() {
 
           case 'SET_REFINEMENT_PHASE': {
             session.refinementPhase = message.phase;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -577,7 +964,7 @@ async function startServer() {
                 session.stickers[stickerId].groupId = groupId;
               }
             });
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -587,14 +974,14 @@ async function startServer() {
               if (!group.votes) group.votes = {};
               const current = group.votes[message.participantId] || 0;
               group.votes[message.participantId] = Math.max(0, current + message.delta);
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
 
           case 'UPDATE_GROUP_RANKING': {
             session.groupRanking = message.ranking;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -604,26 +991,26 @@ async function startServer() {
               if (!sticker.votes) sticker.votes = {};
               const current = sticker.votes[message.participantId] || 0;
               sticker.votes[message.participantId] = Math.max(0, current + message.delta);
-              broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+              await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             }
             break;
           }
 
           case 'UPDATE_IMPACT_RANKING': {
             session.impactRanking = message.ranking;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'UPDATE_COMPLEXITY_RANKING': {
             session.complexityRanking = message.ranking;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
           case 'SAVE_FINAL_ANALYSIS': {
             session.finalAnalysis = message.analysis;
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -722,7 +1109,7 @@ async function startServer() {
               }
             }
 
-            broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+            await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
             break;
           }
 
@@ -763,7 +1150,7 @@ async function startServer() {
                 
                 // Update local issue state to reflect sync
                 issue.estimate = message.estimate;
-                broadcast(sessionId, { type: 'SESSION_UPDATE', session });
+                await broadcastAndSave(sessionId, session, { type: 'SESSION_UPDATE', session });
               } catch (err) {
                 console.error("Jira Sync Error:", err);
                 ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to sync with Jira' }));
@@ -777,17 +1164,31 @@ async function startServer() {
       }
     });
 
-    ws.on("close", () => {
+    ws.on("close", async () => {
       if (currentSessionId && currentParticipantId) {
-        const session = sessions[currentSessionId];
+        const session = await getSession(currentSessionId);
         if (session) {
           delete session.participants[currentParticipantId];
+          await setSession(currentSessionId, session);
           clients[currentSessionId]?.delete(ws);
           broadcast(currentSessionId, { type: 'SESSION_UPDATE', session });
         }
       }
     });
   });
+
+  async function broadcastAndSave(sessionId: string, session: Session, message: ServerMessage) {
+    await setSession(sessionId, session);
+    const sessionClients = clients[sessionId];
+    if (sessionClients) {
+      const payload = JSON.stringify(message);
+      sessionClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(payload);
+        }
+      });
+    }
+  }
 
   function broadcast(sessionId: string, message: ServerMessage) {
     const sessionClients = clients[sessionId];

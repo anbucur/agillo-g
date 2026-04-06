@@ -143,5 +143,6 @@ export type ClientMessage =
   | { type: 'UPDATE_GROUP_RANKING'; sessionId: string; ranking: string[] }
   | { type: 'UPDATE_COMPLEXITY_RANKING'; sessionId: string; ranking: string[] }
   | { type: 'SAVE_FINAL_ANALYSIS'; sessionId: string; analysis: FinalAnalysisResult }
+  | { type: 'QUICK_WIN_ANALYSIS'; sessionId: string }
   | { type: 'GENERATE_DEMO_DATA'; sessionId: string }
   | { type: 'TOGGLE_ANONYMOUS'; sessionId: string; participantId: string; isAnonymous: boolean };

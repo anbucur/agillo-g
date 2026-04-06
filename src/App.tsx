@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { QRCodeSVG } from 'qrcode.react';
-import { GoogleGenAI, Type } from "@google/genai";
 import { 
   Users, 
   Plus, 
@@ -1309,151 +1308,15 @@ function RefinementBoard({ session, participant, sendMessage }: {
   const performGrouping = async () => {
     if (!session.stickers || Object.keys(session.stickers).length === 0) return;
     setIsCategorizing(true);
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const stickersList = Object.values(session.stickers).map(s => ({ id: s.id, text: s.text }));
-      
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: `Group the following feedback items into logical themes.
-        Return a JSON array of groups, where each group has a "title" and an array of "stickerIds".
-        Stickers: ${JSON.stringify(stickersList)}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                stickerIds: { type: Type.ARRAY, items: { type: Type.STRING } }
-              },
-              required: ["title", "stickerIds"]
-            }
-          }
-        }
-      });
-
-      const result = JSON.parse(response.text || "[]");
-      const newGroups: Record<string, StickerGroup> = {};
-      const stickerUpdates: Record<string, string> = {};
-
-      result.forEach((g: any) => {
-        const groupId = `group-${uuidv4()}`;
-        newGroups[groupId] = {
-          id: groupId,
-          title: g.title,
-          votes: {}
-        };
-        g.stickerIds.forEach((sid: string) => {
-          stickerUpdates[sid] = groupId;
-        });
-      });
-
-      // Handle any stickers that weren't grouped
-      const ungroupedStickers = Object.keys(session.stickers).filter(sid => !stickerUpdates[sid]);
-      if (ungroupedStickers.length > 0) {
-        const ungroupedId = `group-ungrouped`;
-        newGroups[ungroupedId] = {
-          id: ungroupedId,
-          title: "Other / Ungrouped",
-          votes: {}
-        };
-        ungroupedStickers.forEach(sid => {
-          stickerUpdates[sid] = ungroupedId;
-        });
-      }
-
-      sendMessage({ type: 'SET_GROUPS', sessionId: session.id, groups: newGroups, stickerUpdates });
-      sendMessage({ type: 'SET_REFINEMENT_PHASE', sessionId: session.id, phase: 'GROUPING' });
-    } catch (err) {
-      console.error("Grouping error:", err);
-    } finally {
-      setIsCategorizing(false);
-    }
+    sendMessage({ type: 'CATEGORIZE_STICKERS', sessionId: session.id });
+    setIsCategorizing(false);
   };
 
   const performAnalysis = async () => {
     if (!session.stickerGroups || Object.keys(session.stickerGroups).length === 0) return;
     setIsCategorizing(true);
-    
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      const groupsList = Object.values(session.stickerGroups).map(g => {
-        const totalVotes = Object.values(g.votes || {}).reduce((a, b) => a + b, 0);
-        const priorityRank = session.groupRanking?.indexOf(g.id) ?? -1;
-        const groupStickers = Object.values(session.stickers || {}).filter(s => s.groupId === g.id).map(s => s.text);
-        return { 
-          id: g.id, 
-          title: g.title,
-          stickers: groupStickers,
-          votes: totalVotes, 
-          priorityRank: priorityRank >= 0 ? priorityRank + 1 : 999 
-        };
-      });
-      
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: `Analyze the following prioritized groups of feedback from a retrospective or refinement session. 
-        Identify the good things, the bad things, the blockers, and the ideas. 
-        Create a brief summary of the session. 
-        Propose actionable items based on the feedback groups, focusing on the highest priority ones. 
-        IMPORTANT: For each action item, provide an array of "linkedGroupIds" corresponding to the IDs of the groups that inspired it.
-        Return a JSON object.
-        Groups: ${JSON.stringify(groupsList)}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              summary: { type: Type.STRING },
-              good: { type: Type.ARRAY, items: { type: Type.STRING } },
-              bad: { type: Type.ARRAY, items: { type: Type.STRING } },
-              blockers: { type: Type.ARRAY, items: { type: Type.STRING } },
-              ideas: { type: Type.ARRAY, items: { type: Type.STRING } },
-              actionItems: { 
-                type: Type.ARRAY,
-                items: { 
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    linkedGroupIds: { type: Type.ARRAY, items: { type: Type.STRING } }
-                  },
-                  required: ["title", "description", "linkedGroupIds"]
-                }
-              }
-            },
-            required: ["summary", "good", "bad", "blockers", "ideas", "actionItems"]
-          }
-        }
-      });
-
-      const result = JSON.parse(response.text || "{}");
-      
-      const actionItemsWithIds = (result.actionItems || []).map((item: any) => ({
-        id: uuidv4(),
-        title: item.title,
-        description: item.description,
-        linkedGroupIds: item.linkedGroupIds || []
-      }));
-
-      const analysis = {
-        summary: result.summary || "",
-        good: result.good || [],
-        bad: result.bad || [],
-        blockers: result.blockers || [],
-        ideas: result.ideas || [],
-        actionItems: actionItemsWithIds
-      };
-      
-      sendMessage({ type: 'SAVE_ANALYSIS', sessionId: session.id, analysis });
-    } catch (err) {
-      console.error("Analysis error:", err);
-    } finally {
-      setIsCategorizing(false);
-    }
+    sendMessage({ type: 'ANALYZE_SESSION', sessionId: session.id });
+    setIsCategorizing(false);
   };
 
   const handleStartTimer = () => {
@@ -1470,52 +1333,10 @@ function RefinementBoard({ session, participant, sendMessage }: {
   const performFinalAnalysis = async () => {
     const quickWins = calculateQuickWins();
     if (quickWins.length === 0) return;
-    
-    setIsCategorizing(true);
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: `Based on the following prioritized action items (sorted primarily by the votes of their parent groups, then by Quick Win Index: high value, low complexity), generate a final execution plan and summary for the team.
-        The action items are derived from grouped feedback. Pay special attention to the "groupVotes" and "groupTitles" fields, as action items from highly voted groups are listed first and should be addressed first.
-        
-        Action Items:
-        ${JSON.stringify(quickWins.map(qw => ({ id: qw.id, title: qw.title, description: qw.description, valueScore: qw.valueScore, complexityScore: qw.complexityScore, quickWinIndex: qw.quickWinIndex, groupVotes: qw.groupVotes, groupTitles: qw.groupTitles })))}
-        
-        Return a JSON object with:
-        - summary: A brief encouraging summary of the plan, explicitly mentioning the top themes/groups that the team prioritized based on votes.
-        - rankedItems: An array of objects containing the actionItemId and a brief justification for its priority (mentioning its group's votes or value vs complexity).`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              summary: { type: Type.STRING },
-              rankedItems: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    actionItemId: { type: Type.STRING },
-                    justification: { type: Type.STRING }
-                  },
-                  required: ["actionItemId", "justification"]
-                }
-              }
-            },
-            required: ["summary", "rankedItems"]
-          }
-        }
-      });
 
-      const result = JSON.parse(response.text || "{}");
-      sendMessage({ type: 'SAVE_FINAL_ANALYSIS', sessionId: session.id, analysis: result });
-    } catch (error) {
-      console.error("Final analysis failed:", error);
-    } finally {
-      setIsCategorizing(false);
-    }
+    setIsCategorizing(true);
+    sendMessage({ type: 'QUICK_WIN_ANALYSIS', sessionId: session.id });
+    setIsCategorizing(false);
   };
 
   const formatTime = (ms: number) => {
